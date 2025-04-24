@@ -126,25 +126,25 @@ st.subheader("Route Details")
 if show_btn and paths:
     st.dataframe(table_df, use_container_width=True)
 elif show_btn:
-    st.write("")  # errors/warnings shown above
+    st.write("")  # errors/warnings already shown above
 else:
     st.info("Select a country & cities, then click ▶ Show Minimal Path.")
 
 # ─── Map rendering (PyDeck) ────────────────────────────────────
 st.subheader("Map View")
 
-# Base layer: all points in light grey
+# Base layer: all points in dark blue
 df_all = pd.DataFrame(all_points)
 scatter = pdk.Layer(
     "ScatterplotLayer",
     df_all,
     get_position=["lon", "lat"],
-    get_fill_color=[200, 200, 200, 100],
+    get_fill_color=[0, 0, 139, 180],   # dark blue
     get_radius=2000,
     pickable=False
 )
 
-# Path layer: always red for minimal route
+# Path layer: red for minimal route
 path_layers = []
 if paths:
     coords = [[c["lon"], c["lat"]] for c in paths[0]["cities"]]
@@ -154,7 +154,7 @@ if paths:
             "PathLayer",
             df_path,
             get_path="path",
-            get_color=[255, 0, 0, 200],  # red
+            get_color=[255, 0, 0, 200],   # bright red
             get_width=5,
             width_min_pixels=2
         )
@@ -169,7 +169,9 @@ view_state = pdk.ViewState(
 deck = pdk.Deck(
     layers=[scatter] + path_layers,
     initial_view_state=view_state,
-    map_style="mapbox://styles/mapbox/streets-v11"
+    map_style="mapbox://styles/mapbox/streets-v11",
+    height=900  # double default vertical size
 )
 
-st.pydeck_chart(deck)
+
+st.pydeck_chart(deck, use_container_width=True)
