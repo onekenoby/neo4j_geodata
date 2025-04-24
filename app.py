@@ -43,7 +43,32 @@ def load_points():
             })
     return pts
 
+# ─── Inline loader for all network edges ────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_edges():
+    q = """
+    MATCH (a:OperationPoint)-[r:SECTION]-(b:OperationPoint)
+    RETURN
+      a.geolocation.longitude AS lon1,
+      a.geolocation.latitude  AS lat1,
+      b.geolocation.longitude AS lon2,
+      b.geolocation.latitude  AS lat2
+    """
+    edges = []
+    with driver.session() as ses:
+        for rec in ses.run(q):
+            edges.append({
+                "lon1": rec["lon1"],
+                "lat1": rec["lat1"],
+                "lon2": rec["lon2"],
+                "lat2": rec["lat2"]
+            })
+    return pd.DataFrame(edges)
+
+# Load data
 all_points = load_points()
+all_edges  = load_edges()
+
 if not all_points:
     st.error("No OperationPoint data found. Please load your CSV & project GDS.")
     st.stop()
@@ -126,25 +151,27 @@ st.subheader("Route Details")
 if show_btn and paths:
     st.dataframe(table_df, use_container_width=True)
 elif show_btn:
-    st.write("")  # errors/warnings already shown above
+    st.write("")  
 else:
     st.info("Select a country & cities, then click ▶ Show Minimal Path.")
 
 # ─── Map rendering (PyDeck) ────────────────────────────────────
 st.subheader("Map View")
 
-# Base layer: all points in dark blue
-df_all = pd.DataFrame(all_points)
-scatter = pdk.Layer(
-    "ScatterplotLayer",
-    df_all,
-    get_position=["lon", "lat"],
-    get_fill_color=[0, 0, 139, 180],   # dark blue
-    get_radius=2000,
+# 1) Base network edges in light grey, thicker lines
+edge_layer = pdk.Layer(
+    "LineLayer",
+    all_edges,
+    get_source_position=["lon1", "lat1"],
+    get_target_position=["lon2", "lat2"],
+    get_color=[150, 150, 150, 120],
+    get_width=5,            # increased line thickness
+    width_min_pixels=2,
+    width_max_pixels=20,
     pickable=False
 )
 
-# Path layer: red for minimal route
+# 2) Path layer: red for minimal route
 path_layers = []
 if paths:
     coords = [[c["lon"], c["lat"]] for c in paths[0]["cities"]]
@@ -154,24 +181,26 @@ if paths:
             "PathLayer",
             df_path,
             get_path="path",
-            get_color=[255, 0, 0, 200],   # bright red
+            get_color=[255, 0, 0, 200],  # bright red
             get_width=5,
             width_min_pixels=2
         )
     )
 
+# 3) View state centered on Italy
+df_pts = pd.DataFrame(all_points)
 view_state = pdk.ViewState(
-    latitude=df_all["lat"].mean(),
-    longitude=df_all["lon"].mean(),
+    latitude=df_pts["lat"].mean(),
+    longitude=df_pts["lon"].mean(),
     zoom=6
 )
 
+# 4) Build deck with double vertical size
 deck = pdk.Deck(
-    layers=[scatter] + path_layers,
+    layers=[edge_layer] + path_layers,
     initial_view_state=view_state,
     map_style="mapbox://styles/mapbox/streets-v11",
-    height=900  # double default vertical size
+    height=800
 )
-
 
 st.pydeck_chart(deck, use_container_width=True)

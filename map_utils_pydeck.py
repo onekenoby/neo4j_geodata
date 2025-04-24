@@ -17,7 +17,7 @@ def draw_map_pydeck(all_points, paths, visibility_flags):
     df_all = pd.DataFrame(all_points)
 
     scatter = pdk.Layer(
-        "ScatterplotLayer",
+        "ScatterplotLayer ",
         df_all,
         get_position=["lon","lat"],
         get_fill_color=[180,180,180,120],
