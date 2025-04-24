@@ -2,133 +2,174 @@
 
 import streamlit as st
 import pandas as pd
+import pydeck as pdk
 
-import neo4j_utils
-import map_utils_pydeck
+from neo4j_utils import driver, ensure_gds_graph, get_minimal_path_dijkstra
 import export_utils
-from config import PATH_LABELS
 
-# ─── Streamlit Setup ───────────────────────────────────────────
-st.set_page_config(page_title="Country → City Paths", layout="wide")
-st.title("🌍 Select Country, Then City – Top-3 Shortest Paths")
+# ────────────────── Streamlit Setup ─────────────────────────────
+st.set_page_config(page_title="Country → City Minimal Path", layout="wide")
+st.title("🌍 Country → City – True Minimal Path")
 
-# Ensure GDS graph (if you use it)
+# 1) Project GDS graph once
 try:
-    neo4j_utils.ensure_gds_graph()
-except AttributeError:
+    ensure_gds_graph()
+except Exception:
     pass
 
-# ─── Load & Cache Points ───────────────────────────────────────
+# ─── Inline loader for all points (including country) ────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_all_points():
-    return neo4j_utils.get_all_point_coords()
+def load_points():
+    q = """
+    MATCH (op:OperationPoint)
+    OPTIONAL MATCH (op)-[r:NAMED]->(pn:OperationPointName)
+    RETURN
+      op.id      AS id,
+      coalesce(pn.name, op.id) AS label,
+      r.country  AS country,
+      op.geolocation.latitude  AS lat,
+      op.geolocation.longitude AS lon
+    ORDER BY country, label
+    """
+    pts = []
+    with driver.session() as ses:
+        for rec in ses.run(q):
+            pts.append({
+                "id":      rec["id"],
+                "label":   rec["label"],
+                "country": rec["country"] or "Unknown",
+                "lat":     rec["lat"],
+                "lon":     rec["lon"]
+            })
+    return pts
 
-all_points = load_all_points()
+all_points = load_points()
+if not all_points:
+    st.error("No OperationPoint data found. Please load your CSV & project GDS.")
+    st.stop()
 
-# Build country list
-countries = sorted({pt["country"] for pt in all_points})
-
-# ─── Sidebar ────────────────────────────────────────────────────
-if "show_paths" not in st.session_state:
-    st.session_state.show_paths = False
-
+# ─── Sidebar ─────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
-
-    # 1) Country selector
-    country = st.selectbox("Country", countries, index=0)
-
-    # 2) Filter cities by country for the next two dropdowns
-    pts_in_country = [pt for pt in all_points if pt["country"] == country]
-    labels = [pt["label"] for pt in pts_in_country]
-
-    # 3) City selectors
-    start_label = st.selectbox("Start City", labels, index=0)
-    end_label   = st.selectbox("End City",   labels, index=min(1, len(labels)-1))
-
-    # 4) Show Paths button
-    if st.button("Show Paths"):
-        st.session_state.show_paths = True
-
-    # 5) Path toggles (only after Show Paths)
-    if st.session_state.show_paths:
-        toggles = [
-            st.checkbox(PATH_LABELS[i], True, key=f"tog_{i}")
-            for i in range(len(PATH_LABELS))
-        ]
-    else:
-        toggles = [False] * len(PATH_LABELS)
-
-    # 6) Export controls
+    
+    # Country selector
+    countries = sorted({pt["country"] for pt in all_points})
+    country = st.selectbox("Country", countries)
+    
+    # Filter points by country
+    pts = [pt for pt in all_points if pt["country"] == country]
+    labels = [pt["label"] for pt in pts]
+    
+    # Search + select Start City
+    start_search = st.text_input("🔍 Search Start City")
+    start_opts = [lbl for lbl in labels if start_search.lower() in lbl.lower()]
+    start_label = st.selectbox("Start City", start_opts or ["–"])
+    
+    # Search + select End City
+    end_search = st.text_input("🔍 Search End City")
+    end_opts = [lbl for lbl in labels if end_search.lower() in lbl.lower()]
+    end_label = st.selectbox("End City", end_opts or ["–"])
+    
+    # Show Minimal Path button
+    show_btn = st.button("▶ Show Minimal Path")
+    
+    # Export controls
     export_fmt = st.radio("Export format", ["CSV", "JSON"])
-    do_export   = st.button("Download Table")
+    download   = st.button("Download Table")
 
-# ─── Compute Paths ─────────────────────────────────────────────
+# ─── Compute minimal path on demand ─────────────────────────────
 paths = []
-if st.session_state.show_paths:
-    # map labels back to ids
-    label_to_id = {pt["label"]: pt["id"] for pt in pts_in_country}
-    src_id = label_to_id[start_label]
-    dst_id = label_to_id[end_label]
-    paths = neo4j_utils.get_top_paths(src_id, dst_id, k=3)
+if show_btn:
+    if start_label not in labels or end_label not in labels:
+        st.warning("Please select valid start and end cities.")
+    elif start_label == end_label:
+        st.warning("Start and end must differ.")
+    else:
+        src_id = next(pt["id"] for pt in pts if pt["label"] == start_label)
+        dst_id = next(pt["id"] for pt in pts if pt["label"] == end_label)
+        paths = get_minimal_path_dijkstra(src_id, dst_id)
+        if not paths:
+            st.error("No path found between those cities.")
 
-# ─── Build Comparison Table ────────────────────────────────────
+# ─── Build route details DataFrame ──────────────────────────────
 table_df = pd.DataFrame()
-if st.session_state.show_paths and paths:
-    # For each path, only include if toggle True
-    table_df = pd.DataFrame([
-        {
-          "Path": PATH_LABELS[i],
-          "Stops": len(p["cities"]),
-          "Route": " → ".join([
-              # convert each city-id back to its label in this country
-              next(pt["label"] for pt in pts_in_country if pt["id"] == c["id"])
-              for c in p["cities"]
-          ]),
-          "Total Distance (km)": p["total_distance"]
-        }
-        for i, p in enumerate(paths) if toggles[i]
-    ])
+if paths:
+    p = paths[0]
+    table_df = pd.DataFrame([{
+        "Stops": len(p["cities"]),
+        "Route": " → ".join(c["label"] for c in p["cities"]),
+        "Total Distance (km)": p["total_distance"]
+    }])
 
-# ─── Export Logic ──────────────────────────────────────────────
-if do_export and not table_df.empty:
-    if export_fmt == "CSV":
-        st.download_button(
-            "Download CSV",
-            data=export_utils.df_to_csv(table_df),
-            file_name="paths.csv",
-            mime="text/csv"
-        )
+# ─── Export logic ────────────────────────────────────────────────
+if download:
+    if table_df.empty:
+        st.warning("No route to download. Run 'Show Minimal Path' first.")
     else:
-        st.download_button(
-            "Download JSON",
-            data=export_utils.df_to_json(table_df),
-            file_name="paths.json",
-            mime="application/json"
-        )
+        if export_fmt == "CSV":
+            st.download_button(
+                "Download CSV",
+                data=export_utils.df_to_csv(table_df),
+                file_name="minimal_path.csv",
+                mime="text/csv"
+            )
+        else:
+            st.download_button(
+                "Download JSON",
+                data=export_utils.df_to_json(table_df),
+                file_name="minimal_path.json",
+                mime="application/json"
+            )
 
-# ─── Display Table ─────────────────────────────────────────────
-st.subheader("Comparison Table")
-if st.session_state.show_paths:
-    if not table_df.empty:
-        st.dataframe(table_df, use_container_width=True)
-    else:
-        st.write("No routes selected (toggle on).")
+# ─── Display route table ────────────────────────────────────────
+st.subheader("Route Details")
+if show_btn and paths:
+    st.dataframe(table_df, use_container_width=True)
+elif show_btn:
+    st.write("")  # errors/warnings shown above
 else:
-    st.write("Select a country and cities, then click **Show Paths**.")
+    st.info("Select a country & cities, then click ▶ Show Minimal Path.")
 
-# ─── Map View (PyDeck) ────────────────────────────────────────
+# ─── Map rendering (PyDeck) ────────────────────────────────────
 st.subheader("Map View")
-deck = map_utils_pydeck.draw_map_pydeck(
-    all_points,   # still plot all points
-    paths,
-    toggles
-)
-st.pydeck_chart(deck)
 
-# ─── Cleanup ───────────────────────────────────────────────────
-# Optional: explicitly close driver
-try:
-    neo4j_utils.close_driver()
-except AttributeError:
-    pass
+# Base layer: all points in light grey
+df_all = pd.DataFrame(all_points)
+scatter = pdk.Layer(
+    "ScatterplotLayer",
+    df_all,
+    get_position=["lon", "lat"],
+    get_fill_color=[200, 200, 200, 100],
+    get_radius=2000,
+    pickable=False
+)
+
+# Path layer: always red for minimal route
+path_layers = []
+if paths:
+    coords = [[c["lon"], c["lat"]] for c in paths[0]["cities"]]
+    df_path = pd.DataFrame({"path": [coords]})
+    path_layers.append(
+        pdk.Layer(
+            "PathLayer",
+            df_path,
+            get_path="path",
+            get_color=[255, 0, 0, 200],  # red
+            get_width=5,
+            width_min_pixels=2
+        )
+    )
+
+view_state = pdk.ViewState(
+    latitude=df_all["lat"].mean(),
+    longitude=df_all["lon"].mean(),
+    zoom=6
+)
+
+deck = pdk.Deck(
+    layers=[scatter] + path_layers,
+    initial_view_state=view_state,
+    map_style="mapbox://styles/mapbox/streets-v11"
+)
+
+st.pydeck_chart(deck)

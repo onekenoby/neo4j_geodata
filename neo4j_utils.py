@@ -1,132 +1,124 @@
 # neo4j_utils.py
-
 from neo4j import GraphDatabase
-from config import NEO4J_URI, NEO4J_USER, NEO4J_PASS, GDS_GRAPH_NAME
+from config import NEO4J_URI, USERNAME, PASSWORD, GDS_GRAPH_NAME
 
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(USERNAME, PASSWORD),
+    max_connection_pool_size=50,
+    connection_timeout=30
+)
 
-
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS), max_connection_pool_size=50)
-
-def get_all_countries():
+def ensure_gds_graph():
     """
-    Return a sorted list of all distinct country codes from NAMED relationships.
+    Project the OperationPoint–SECTION graph into memory for GDS if not already.
     """
     with driver.session() as ses:
-        result = ses.run("""
-            MATCH ()-[r:NAMED]->()
-            RETURN DISTINCT r.country AS country
-            ORDER BY r.country
-        """)
-        return [r["country"] for r in result]
+        exists = ses.run(
+            "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+            name=GDS_GRAPH_NAME
+        ).single()["exists"]
+        if not exists:
+            ses.run(f"""
+                CALL gds.graph.project(
+                  '{GDS_GRAPH_NAME}',
+                  'OperationPoint',
+                  {{
+                    SECTION: {{
+                      type: 'SECTION',
+                      properties: 'sectionlength',
+                      orientation: 'UNDIRECTED'
+                    }}
+                  }}
+                )
+            """)
 
 def get_all_point_coords():
     """
-    Return list of dicts {id, label, country, lat, lon} for every OperationPoint.
+    Return list of dicts {id,label,country,lat,lon} for every OperationPoint.
     """
     with driver.session() as ses:
-        result = ses.run("""
-            MATCH (op:OperationPoint)-[r:NAMED]->(pn:OperationPointName)
-            RETURN
-              op.id     AS id,
-              pn.name   AS label,
-              r.country AS country,
-              op.geolocation.latitude  AS lat,
-              op.geolocation.longitude AS lon
-            ORDER BY pn.name
-        """)
+        q = """
+        MATCH (op:OperationPoint)
+        OPTIONAL MATCH (op)-[:NAMED]->(pn:OperationPointName)
+        OPTIONAL MATCH (op)-[r:NAMED]->()
+        RETURN op.id AS id,
+               coalesce(pn.name, op.id) AS label,
+               r.country      AS country,
+               op.geolocation.latitude  AS lat,
+               op.geolocation.longitude AS lon
+        ORDER BY label
+        """
+        result = ses.run(q)
         return [
             {
-              "id": rec["id"],
-              "label": rec["label"],
-              "country": rec["country"],
-              "lat": rec["lat"],
-              "lon": rec["lon"]
+                "id": rec["id"],
+                "label": rec["label"],
+                "country": rec["country"] or "Unknown",
+                "lat": rec["lat"],
+                "lon": rec["lon"]
             }
             for rec in result
         ]
 
-# ... (rest of your get_top_paths, ensure_gds_graph, close_driver unchanged) ...
-
-def get_top_paths_gds(source_id: str, target_id: str, k: int = 3):
+def get_minimal_path_dijkstra(src_prop_id: str, dst_prop_id: str):
     """
-    Use GDS Yen’s algorithm to get the top-k shortest paths.
+    Compute the true minimal path between two OperationPoint IDs using GDS Dijkstra.
+    Returns a list with one dict: {cities, edges, total_distance}.
     """
-    query = f"""
-    CALL gds.shortestPath.yens.stream(
-      '{GDS_GRAPH_NAME}',
-      {{ startNode: $src, endNode: $dst, k: $k, relationshipWeightProperty: 'sectionlength' }}
-    )
-    YIELD path, cost
-    RETURN path, cost AS total_distance
-    """
-    paths = []
     with driver.session() as ses:
-        for rec in ses.run(query, src=source_id, dst=target_id, k=k):
-            nodes = rec["path"].nodes
-            rels  = rec["path"].relationships
-            cities = [
-                {"id": n.id,
-                 "lat": n.geolocation.latitude,
-                 "lon": n.geolocation.longitude}
-                for n in nodes
-            ]
-            edges = [
-                {"source": r.start_node.id,
-                 "target": r.end_node.id,
-                 "distance": r.properties["sectionlength"]}
-                for r in rels
-            ]
-            paths.append({
-                "cities": cities,
-                "edges": edges,
-                "total_distance": rec["total_distance"]
+        # lookup internal node IDs
+        endpoints = ses.run(
+            "MATCH (s:OperationPoint {id:$src}), (t:OperationPoint {id:$dst})"
+            " RETURN id(s) AS sId, id(t) AS tId",
+            src=src_prop_id, dst=dst_prop_id
+        ).single()
+        if not endpoints:
+            return []
+        sId, tId = endpoints["sId"], endpoints["tId"]
+
+        # run Dijkstra
+        path_rec = ses.run(f"""
+            CALL gds.shortestPath.dijkstra.stream(
+              '{GDS_GRAPH_NAME}',
+              {{ sourceNode: $sId, targetNode: $tId, relationshipWeightProperty: 'sectionlength' }}
+            )
+            YIELD nodeIds, costs
+            RETURN nodeIds, costs AS totalDistance
+        """, sId=sId, tId=tId).single()
+        if not path_rec:
+            return []
+
+        node_ids = path_rec["nodeIds"]
+        total    = path_rec["totalDistance"]
+
+        # fetch node properties
+        cities = []
+        for nid in node_ids:
+            r = ses.run(
+                "MATCH (op:OperationPoint) WHERE id(op) = $nid"
+                " RETURN op.id AS id, op.id AS label, op.geolocation.latitude AS lat, op.geolocation.longitude AS lon",
+                nid=nid
+            ).single()
+            cities.append({
+                "id":    r["id"],
+                "label": r["label"],
+                "lat":   r["lat"],
+                "lon":   r["lon"]
             })
-    return paths
 
-def get_top_paths_cypher(source_id: str, target_id: str, limit: int = 3):
-    """
-    Fallback pure-Cypher method for k-shortest paths.
-    """
-    query = """
-    MATCH path = (start:OperationPoint {id:$src})-[:SECTION*1..5]-(end:OperationPoint {id:$dst})
-    WHERE ALL(n IN nodes(path)[1..-1] WHERE n.id <> $src)
-    WITH path,
-         reduce(acc=0, r IN relationships(path) | acc + r.sectionlength) AS total_distance
-    ORDER BY total_distance ASC
-    LIMIT $lim
-    RETURN path, total_distance
-    """
-    paths = []
-    with driver.session() as ses:
-        for rec in ses.run(query, src=source_id, dst=target_id, lim=limit):
-            cities = [
-                {"id": n["id"],
-                 "lat": n["geolocation"].latitude,
-                 "lon": n["geolocation"].longitude}
-                for n in rec["path"].nodes
-            ]
-            edges = [
-                {"source": r.start_node["id"],
-                 "target": r.end_node["id"],
-                 "distance": r["sectionlength"]}
-                for r in rec["path"].relationships
-            ]
-            paths.append({
-                "cities": cities,
-                "edges": edges,
-                "total_distance": rec["total_distance"]
+        # build edges with distances
+        edges = []
+        for a, b in zip(cities, cities[1:]):
+            rel = ses.run(
+                "MATCH (a:OperationPoint {id:$id1})-[r:SECTION]-(b:OperationPoint {id:$id2})"
+                " RETURN r.sectionlength AS dist",
+                id1=a["id"], id2=b["id"]
+            ).single()
+            edges.append({
+                "source":   a["id"],
+                "target":   b["id"],
+                "distance": rel["dist"] if rel else None
             })
-    return paths
 
-def get_top_paths(source_id: str, target_id: str, k: int = 3):
-    """
-    Primary entrypoint: try GDS first, fallback to Cypher.
-    """
-    try:
-        return get_top_paths_gds(source_id, target_id, k)
-    except Exception:
-        return get_top_paths_cypher(source_id, target_id, k)
-
-def close_driver():
-    """Cleanly close the Neo4j driver."""
-    driver.close()
+        return [{"cities": cities, "edges": edges, "total_distance": total}]
